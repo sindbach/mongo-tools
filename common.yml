@@ -51,6 +51,13 @@ mongo_tools_variables:
       - name: qa-tests-wt
       - name: unit
       - name: vet
+      - name: replay-dist
+      - name: replay-sanity_check
+      - name: replay-go_test
+      - name: replay-auth_test
+      - name: replay-sharded_test
+      - name: replay-repl_test
+      - name: replay-replay_test
     ubuntu1204_ssl_task_list: &ubuntu1204_ssl_tasks
       - name: dist
       - name: integration
@@ -553,6 +560,123 @@ functions:
       permissions: public-read
       content_type: application/octet-stream
       display_name: ${tool}
+
+  "fetch source" :
+    - command: git.get_project
+      params:
+        directory: src
+    - command: git.apply_patch
+      params:
+        directory: src
+
+
+  "upload archive" :
+    command: s3.put
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: src/${filename}
+      remote_file: mongoreplay/archive/${build_id}/${filename}
+      bucket: mciuploads
+      permissions: public-read
+      content_type: application/gzip
+      display_name: ${filename}
+
+  "create timeseries" :
+    command: shell.exec
+    params:
+      working_dir: src
+      script: |
+        git clone git@github.com:10gen/support-tools
+        sudo pip install argparse python-dateutil pytz
+        python support-tools/timeseries/timeseries.py /data/mongoreplay/diagnostic.data --html timeseries.html
+
+  "upload timeseries" :
+    command: s3.put
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: src/timeseries.html
+      remote_file: mongoreplay/timeseries/${build_id}/timeseries.html
+      bucket: mciuploads
+      permissions: public-read
+      content_type: text/html
+      display_name: timeseries.html
+
+  "fetch pcap" :
+      command: s3.get
+      params:
+        bucket: boxes.10gen.com
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: src/testPcap/${pcapFname}
+        remote_file: build/mongoreplay/${pcapFname}
+
+  "fetch ftdc" :
+  - command: shell.exec
+    type: test
+    params:
+      working_dir: src
+      script: |
+        . ./set_gopath.sh
+        go get github.com/10gen/ftdc-utils/cmd/ftdc
+
+  "create auth_user" :
+  - command: shell.exec
+    params:
+      script: |
+              set -e
+              set -o verbose
+              cd mongodb
+              ./mongo --port ${mongod_port} admin --eval "db.createUser({user:\"authorizedUser\", pwd: \"authorizedPwd\", roles:[\"readWriteAnyDatabase\", \"clusterManager\"]});"
+
+  "create sharded_cluster" :
+    - command: shell.exec
+      params:
+        background: true
+        script: |
+          set -e
+          set -o verbose
+          cd mongodb
+          echo "starting mongodb"
+          mkdir -p /data/db/
+          ./mongo --nodb --eval 'var d = new ShardingTest({shards:3, mongos:[{port:${mongod_port}}]}); while(true){sleep(1000)}' 
+    - command: shell.exec
+      params:
+        script: |
+          set -e
+          set -o verbose
+          cd mongodb 
+          ./mongo --nodb --eval 'var d; assert.soon(function(x){try{d = new Mongo("localhost:${mongod_port}"); return true} catch(e){return false}}, "timed out connection");d.setLogLevel(5, "write");'
+
+  "create repl_set" :
+    - command: shell.exec
+      params:
+        background: true
+        script: |
+          set -e
+          set -o verbose
+          cd mongodb
+          echo "starting mongodb"
+          mkdir -p /data/db/
+          ./mongo --nodb --eval 'var repl = new ReplSetTest({nodes:3, startPort:${mongod_port}});repl.startSet();repl.initiate();repl.awaitSecondaryNodes();while(true){sleep(1000);}'
+    - command: shell.exec
+      params:
+        script: |
+          set -e
+          set -o verbose
+          cd mongodb 
+          ./mongo --nodb --eval 'assert.soon(function(x){try{var d = new Mongo("localhost:${mongod_port}"); return true} catch(e){return false}}, "timed out connection")'
+
+  "run go_test" :
+  - command: shell.exec
+    type: test
+    params:
+      working_dir: src
+      script: |
+        . ./set_gopath.sh
+        ${environment_vars} go test ${additional_args} -v > ${filename}.suite
+
 
 pre:
   - command: shell.exec
@@ -1231,6 +1355,173 @@ tasks:
           set -o verbose
           . ./set_gopath.sh
           go tool vet bsondump common mongo*
+
+- name: replay-dist
+  commands:
+  - func: "fetch source"
+  - func: "build tool"
+    vars:
+      tool: mongoreplay
+  - func: "upload tool"
+    vars:
+      tool: mongoreplay
+  - func: "build tool"
+
+- name: replay-sanity_check
+  depends_on:
+  - name: replay-dist
+  commands:
+  - command: expansions.update
+    params:
+       updates:
+       - key: "mongod_args"
+         concat: " --port 20000"
+  - func: "fetch source"
+  - func: "fetch tool"
+    vars:
+      tool: mongoreplay
+  - func: "download mongod"
+  - func: "start mongod"
+  - func: "wait for mongod to be ready"
+  - command: shell.exec
+    params:
+      working_dir: src
+      script: |
+        set -e
+        chmod +x mongoreplay
+        PATH=$PATH:`pwd`:`pwd`/../mongodb
+        echo "Running sanity check"
+        ./sanity_check.sh -p ${mongod_port}
+
+- name: replay-go_test
+  depends_on:
+  - name: replay-dist
+  commands:
+  - func: "fetch source"
+  - func: "fetch tool"
+    vars:
+      tool: mongoreplay
+  - func: "fetch pcap"
+    vars:
+      pcapFname: getmore_multi_channel.pcap
+  - func: "fetch pcap"
+    vars:
+      pcapFname: getmore_single_channel.pcap
+  - func: "download mongod"
+  - func: "start mongod"
+    vars:
+        mongod_port: 20000
+  - func: "wait for mongod to be ready"
+  - func: "run go_test"
+    vars:
+        filename: playtest
+
+- name: replay-sharded_test
+  depends_on:
+  - name: replay-dist
+  commands:
+  - func: "fetch source"
+  - func: "fetch tool"
+    vars:
+      tool: mongoreplay
+  - func: "fetch pcap"
+    vars:
+      pcapFname: getmore_multi_channel.pcap
+  - func: "fetch pcap"
+    vars:
+      pcapFname: getmore_single_channel.pcap
+  - func: "download mongod"
+  - func: "create sharded_cluster"
+    vars:
+        mongod_port: 20010
+  - func: "run go_test"
+    vars:
+        filename: sharded
+        environment_vars: DB_PORT=20010
+        additional_args: --run "LiveDB"
+
+- name: replay-auth_test
+  depends_on:
+  - name: replay-dist
+  commands:
+  - func: "fetch source"
+  - func: "fetch tool"
+    vars:
+      tool: mongoreplay
+  - func: "fetch pcap"
+    vars:
+      pcapFname: getmore_multi_channel.pcap
+  - func: "fetch pcap"
+    vars:
+      pcapFname: getmore_single_channel.pcap
+  - func: "download mongod"
+  - func: "start mongod"
+    vars:
+        mongod_port: 20000
+        additional_args: --auth
+  - func: "wait for mongod to be ready"
+  - func: "create auth_user"
+    vars:
+        mongod_port: 20000
+  - func: "run go_test"
+    vars:
+        environment_vars: AUTH=1
+        filename: authtest
+        additional_args: --run "(LiveDB)|(Authed)"
+
+- name: replay-repl_test
+  depends_on:
+  - name: replay-dist
+  commands:
+  - func: "fetch source"
+  - func: "fetch tool"
+    vars:
+      tool: mongoreplay
+  - func: "fetch pcap"
+    vars:
+      pcapFname: getmore_multi_channel.pcap
+  - func: "fetch pcap"
+    vars:
+      pcapFname: getmore_single_channel.pcap
+  - func: "download mongod"
+  - func: "create repl_set"
+    vars:
+      mongod_port: 20000
+  - func: "run go_test"
+    vars:
+        filename: repltest
+        additional_args: --run "LiveDB"
+
+- name: replay-replay_test
+  depends_on:
+  - name: replay-dist
+  commands:
+  - func: "fetch source"
+  - func: "fetch tool"
+    vars:
+      tool: mongoreplay
+  - func: "download mongod"
+  - func: "fetch ftdc"
+  - command: shell.exec
+    params:
+      working_dir: src
+      script: |
+        set -e
+        . ./set_gopath.sh
+        PATH=$PATH:`pwd`:`pwd`/vendor/bin:`pwd`/../mongodb
+        chmod +x mongoreplay
+        echo "Running replay test"
+        ./replay_test.sh --verbose --explicit --keep
+  - command: shell.exec
+    params:
+      working_dir: src
+      script: |
+        tar czf replay.tar.gz tmp.*
+  - func: "upload archive"
+    vars:
+      filename: replay.tar.gz
+  - func: "create timeseries"
+  - func: "upload timeseries"
 
 buildvariants:
 #######################################
